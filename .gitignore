@@ -1,0 +1,11 @@
+.env
+output/
+Thumbs.db
+.DS_Store
+.vscode/
+.idea/
+.n8n/
+__pycache__/
+*.pyc
+
+n8n_workflow.json
