@@ -8,7 +8,7 @@ Usage:
 
 Requires:
     - GEMINI_API_KEY or GROQ_API_KEY in .env (at least one)
-    - PEXELS_API_KEY in .env
+    - At least one image API key: PEXELS_API_KEY, UNSPLASH_ACCESS_KEY, or PIXABAY_API_KEY
     - FFmpeg installed and on PATH
 """
 
@@ -23,6 +23,7 @@ from pathlib import Path
 from io import BytesIO
 
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from PIL import Image, ImageDraw, ImageFont
 import edge_tts
 from moviepy import (
@@ -34,6 +35,8 @@ from moviepy import (
     vfx,
 )
 import google.generativeai as genai
+import google.generativeai as genai
+import argparse
 from dotenv import load_dotenv
 
 # ──────────────────────────────────────────────
@@ -45,21 +48,39 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
 
-VIDEO_WIDTH = 1920
-VIDEO_HEIGHT = 1080
+VIDEO_WIDTH = 1280
+VIDEO_HEIGHT = 720
 FPS = 24
 VOICE = "en-US-ChristopherNeural"  # Natural male voice
 
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "output"
 TEMP_DIR = OUTPUT_DIR / "temp"
+STATE_FILE = TEMP_DIR / "pipeline_state.json"
 
 
-def setup_directories():
+def setup_directories(clean=False):
     """Create output and temp directories."""
     OUTPUT_DIR.mkdir(exist_ok=True)
     TEMP_DIR.mkdir(exist_ok=True)
-    print("[✓] Directories ready.")
+    if clean and STATE_FILE.exists():
+        STATE_FILE.unlink()
+    print("[+] Directories ready.")
+
+
+def save_state(data: dict):
+    """Save pipeline state to JSON."""
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+def load_state() -> dict:
+    """Load pipeline state from JSON."""
+    if not STATE_FILE.exists():
+        print("[!] No state file found. Run 'script' stage first.")
+        sys.exit(1)
+    with open(STATE_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 # ──────────────────────────────────────────────
@@ -100,7 +121,7 @@ IMPORTANT:
 
 def _generate_with_gemini(prompt: str) -> str:
     """Generate script using Google Gemini."""
-    print("  [→] Trying Gemini...")
+    print("  [->] Trying Gemini...")
     genai.configure(api_key=GEMINI_API_KEY)
     model = genai.GenerativeModel("gemini-2.0-flash")
     response = model.generate_content(prompt)
@@ -109,7 +130,7 @@ def _generate_with_gemini(prompt: str) -> str:
 
 def _generate_with_groq(prompt: str) -> str:
     """Generate script using Groq (free tier, llama model)."""
-    print("  [→] Trying Groq...")
+    print("  [->] Trying Groq...")
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
@@ -141,16 +162,16 @@ def generate_script(topic: str) -> dict:
     if GEMINI_API_KEY:
         try:
             raw_text = _generate_with_gemini(prompt)
-            print("  [✓] Gemini responded.")
+            print("  [+] Gemini responded.")
         except Exception as e:
             print(f"  [!] Gemini failed: {e}")
-            print("  [→] Falling back to Groq...")
+            print("  [->] Falling back to Groq...")
 
     # Fallback to Groq
     if raw_text is None and GROQ_API_KEY:
         try:
             raw_text = _generate_with_groq(prompt)
-            print("  [✓] Groq responded.")
+            print("  [+] Groq responded.")
         except Exception as e:
             print(f"  [!] Groq also failed: {e}")
 
@@ -166,7 +187,7 @@ def generate_script(topic: str) -> dict:
     script_data = json.loads(raw_text)
 
     scene_count = len(script_data.get("scenes", []))
-    print(f"[✓] Script generated: \"{script_data.get('title', '')}\" — {scene_count} scenes")
+    print(f"[+] Script generated: \"{script_data.get('title', '')}\" — {scene_count} scenes")
     return script_data
 
 
@@ -193,34 +214,154 @@ def generate_voiceovers(scenes: list) -> list:
 
         asyncio.run(_generate_single_voiceover(narration, audio_path, VOICE))
         audio_paths.append(audio_path)
-        print(f"  [✓] Scene {i + 1} audio saved ({len(narration)} chars)")
+        print(f"  [+] Scene {i + 1} audio saved ({len(narration)} chars)")
 
-    print(f"[✓] All {len(audio_paths)} voiceovers generated.")
+    print(f"[+] All {len(audio_paths)} voiceovers generated.")
     return audio_paths
 
 
 # ──────────────────────────────────────────────
-# Stage 3: Visual Fetching (Pexels API)
+# Stage 3: Multi-Source Visual Fetching
+#   Sources: Pexels, Unsplash, Pixabay
 # ──────────────────────────────────────────────
+import random
+
+UNSPLASH_ACCESS_KEY = os.getenv("UNSPLASH_ACCESS_KEY", "")
+PIXABAY_API_KEY = os.getenv("PIXABAY_API_KEY", "")
+
+
+def _simplify_query(query: str) -> str:
+    """Reduce a long visual query to its 2-3 core keywords for broader results."""
+    words = query.split()
+    # Remove common filler words
+    stop_words = {
+        "a", "an", "the", "of", "in", "on", "at", "for", "to", "with",
+        "and", "or", "is", "are", "was", "were", "be", "been", "being",
+        "that", "this", "it", "its", "from", "by", "as", "into", "about",
+        "showing", "depicting", "featuring", "photo", "image", "picture",
+    }
+    keywords = [w for w in words if w.lower() not in stop_words]
+    # Return 2-3 most important words
+    return " ".join(keywords[:3])
+
+
+def _download_image(url: str) -> Image.Image | None:
+    """Download an image from a URL and return a PIL Image."""
+    try:
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        return Image.open(BytesIO(resp.content))
+    except Exception:
+        return None
+
+
 def fetch_pexels_image(query: str) -> Image.Image | None:
-    """Fetch a landscape image from Pexels for the given query."""
+    """Fetch a random landscape image from Pexels for the given query."""
+    if not PEXELS_API_KEY:
+        return None
     url = "https://api.pexels.com/v1/search"
     headers = {"Authorization": PEXELS_API_KEY}
-    params = {"query": query, "per_page": 5, "orientation": "landscape"}
+    params = {"query": query, "per_page": 15, "orientation": "landscape"}
 
     try:
         resp = requests.get(url, headers=headers, params=params, timeout=15)
         resp.raise_for_status()
-        data = resp.json()
-
-        if data.get("photos"):
-            # Pick the first landscape photo, use the 'large2x' size
-            photo_url = data["photos"][0]["src"]["large2x"]
-            img_resp = requests.get(photo_url, timeout=30)
-            img_resp.raise_for_status()
-            return Image.open(BytesIO(img_resp.content))
+        photos = resp.json().get("photos", [])
+        if photos:
+            photo = random.choice(photos)
+            return _download_image(photo["src"]["large2x"])
     except Exception as e:
-        print(f"  [!] Pexels fetch failed for '{query}': {e}")
+        print(f"    [!] Pexels failed for '{query}': {e}")
+    return None
+
+
+def fetch_unsplash_image(query: str) -> Image.Image | None:
+    """Fetch a random landscape image from Unsplash for the given query."""
+    if not UNSPLASH_ACCESS_KEY:
+        return None
+    url = "https://api.unsplash.com/search/photos"
+    headers = {"Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}"}
+    params = {
+        "query": query,
+        "per_page": 15,
+        "orientation": "landscape",
+        "content_filter": "high",
+    }
+
+    try:
+        resp = requests.get(url, headers=headers, params=params, timeout=15)
+        resp.raise_for_status()
+        results = resp.json().get("results", [])
+        if results:
+            photo = random.choice(results)
+            # Use 'regular' size (~1080px width) for good quality
+            return _download_image(photo["urls"]["regular"])
+    except Exception as e:
+        print(f"    [!] Unsplash failed for '{query}': {e}")
+    return None
+
+
+def fetch_pixabay_image(query: str) -> Image.Image | None:
+    """Fetch a random landscape image from Pixabay for the given query."""
+    if not PIXABAY_API_KEY:
+        return None
+    url = "https://pixabay.com/api/"
+    params = {
+        "key": PIXABAY_API_KEY,
+        "q": query,
+        "per_page": 15,
+        "orientation": "horizontal",
+        "image_type": "photo",
+        "safesearch": "true",
+        "min_width": 1280,
+    }
+
+    try:
+        resp = requests.get(url, headers={}, params=params, timeout=15)
+        resp.raise_for_status()
+        hits = resp.json().get("hits", [])
+        if hits:
+            photo = random.choice(hits)
+            return _download_image(photo["largeImageURL"])
+    except Exception as e:
+        print(f"    [!] Pixabay failed for '{query}': {e}")
+    return None
+
+
+# List of all fetchers — tried in random order for variety
+_IMAGE_FETCHERS = [
+    ("Pexels", fetch_pexels_image),
+    ("Unsplash", fetch_unsplash_image),
+    ("Pixabay", fetch_pixabay_image),
+]
+
+
+def fetch_image_multi_source(query: str) -> Image.Image | None:
+    """
+    Try multiple image sources in random order.
+    If the original query fails everywhere, retry with simplified keywords.
+    """
+    # Shuffle the order so different scenes use different sources
+    fetchers = list(_IMAGE_FETCHERS)
+    random.shuffle(fetchers)
+
+    # Attempt 1: original query across all sources
+    for name, fetcher in fetchers:
+        img = fetcher(query)
+        if img is not None:
+            print(f"    [+] Found via {name}: '{query}'")
+            return img
+
+    # Attempt 2: simplified query across all sources
+    simple_query = _simplify_query(query)
+    if simple_query != query:
+        print(f"    [RETRY] Retrying with simplified query: '{simple_query}'")
+        random.shuffle(fetchers)
+        for name, fetcher in fetchers:
+            img = fetcher(simple_query)
+            if img is not None:
+                print(f"    [+] Found via {name}: '{simple_query}'")
+                return img
 
     return None
 
@@ -279,71 +420,72 @@ def resize_and_crop(img: Image.Image) -> Image.Image:
 
 def fetch_visuals(scenes: list) -> list:
     """
-    Fetch or generate an image for each scene.
+    Fetch or generate an image for each scene in PARALLEL.
+    Tries Pexels, Unsplash, and Pixabay in random order.
     Returns list of image file paths.
     """
-    print("\n[Stage 3] Fetching visuals from Pexels...")
-    image_paths = []
+    sources = []
+    if PEXELS_API_KEY:
+        sources.append("Pexels")
+    if UNSPLASH_ACCESS_KEY:
+        sources.append("Unsplash")
+    if PIXABAY_API_KEY:
+        sources.append("Pixabay")
 
-    for i, scene in enumerate(scenes):
+    print(f"\n[Stage 3] Fetching visuals from {', '.join(sources) or 'fallback only'}...")
+    
+    # Pre-calculate paths to keep order
+    results = [None] * len(scenes)
+    
+    def process_scene(index, scene):
         query = scene["visual_query"]
-        img_path = str(TEMP_DIR / f"scene_{i + 1}.jpg")
-
-        img = fetch_pexels_image(query)
+        img_path = str(TEMP_DIR / f"scene_{index + 1}.jpg")
+        
+        print(f"  [->] Fetching scene {index + 1}: '{query}'...")
+        img = fetch_image_multi_source(query)
         if img is None:
-            print(f"  [!] Fallback for scene {i + 1}: '{query}'")
+            print(f"  [!] All sources failed — using fallback for scene {index + 1}: '{query}'")
             img = create_fallback_image(query)
         else:
-            print(f"  [✓] Scene {i + 1} image fetched: '{query}'")
+            print(f"  [+] Scene {index + 1} image found.")
 
-        img = resize_and_crop(img.convert("RGB"))
-        img.save(img_path, "JPEG", quality=95)
-        image_paths.append(img_path)
+        # Resize/crop immediately
+        try:
+             img = resize_and_crop(img.convert("RGB"))
+             img.save(img_path, "JPEG", quality=95)
+             return index, img_path
+        except Exception as e:
+            print(f"  [!] Error processing image for scene {index + 1}: {e}")
+            return index, None
 
-    print(f"[✓] All {len(image_paths)} visuals ready.")
-    return image_paths
+    # Run in parallel
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        future_to_scene = {executor.submit(process_scene, i, scene): i for i, scene in enumerate(scenes)}
+        for future in as_completed(future_to_scene):
+            i, path = future.result()
+            results[i] = path
+
+    # Check for any failures (shouldn't happen with fallback, but good to be safe)
+    final_paths = [p for p in results if p]
+    
+    if len(final_paths) != len(scenes):
+        print("[!] Warning: Some scenes failed to generate images.")
+    
+    print(f"[+] All {len(final_paths)} visuals ready.")
+    return final_paths
 
 
-# ──────────────────────────────────────────────
-# Stage 4: Video Assembly (MoviePy + FFmpeg)
-# ──────────────────────────────────────────────
 def create_ken_burns_clip(image_path: str, duration: float) -> CompositeVideoClip:
     """
-    Create a clip with a subtle Ken Burns (zoom-in) effect
-    to make the still image feel dynamic.
+    Create a static clip (Ken Burns disabled for speed).
     """
-    # Start slightly zoomed out, end at full size
-    zoom_start = 1.0
-    zoom_end = 1.15
-
-    img_clip = ImageClip(image_path).with_duration(duration)
-
-    def zoom_effect(get_frame, t):
-        """Apply smooth zoom over time."""
-        import numpy as np
-        from PIL import Image as PILImage
-
-        progress = t / duration
-        current_zoom = zoom_start + (zoom_end - zoom_start) * progress
-
-        frame = get_frame(t)
-        h, w = frame.shape[:2]
-
-        # Calculate crop region for zoom
-        new_w = int(w / current_zoom)
-        new_h = int(h / current_zoom)
-        x_offset = (w - new_w) // 2
-        y_offset = (h - new_h) // 2
-
-        cropped = frame[y_offset:y_offset + new_h, x_offset:x_offset + new_w]
-
-        # Resize back to original dimensions
-        pil_img = PILImage.fromarray(cropped)
-        pil_img = pil_img.resize((w, h), PILImage.LANCZOS)
-        return np.array(pil_img)
-
-    zoomed_clip = img_clip.transform(zoom_effect)
-    return zoomed_clip
+    # FASTEST: Static image, no effects
+    clip = ImageClip(image_path).with_duration(duration)
+    
+    # Just ensure it fits 720p (already resized in fetch_visuals)
+    # The resize_and_crop function handles the aspect ratio.
+    
+    return clip
 
 
 def assemble_video(
@@ -377,7 +519,7 @@ def assemble_video(
             video_clip = video_clip.with_effects([vfx.FadeOut(0.8)])
 
         clips.append(video_clip)
-        print(f"  [✓] Scene {i + 1}: {duration:.1f}s")
+        print(f"  [+] Scene {i + 1}: {duration:.1f}s")
 
     # Concatenate all scene clips
     final_clip = concatenate_videoclips(clips, method="compose")
@@ -390,8 +532,8 @@ def assemble_video(
         codec="libx264",
         audio_codec="aac",
         bitrate="5000k",
-        preset="medium",
-        threads=4,
+        preset="ultrafast",  # <--- CRITICAL SPEEDUP
+        threads=8,           # Use more threads
         logger="bar",
     )
 
@@ -401,7 +543,7 @@ def assemble_video(
         clip.close()
 
     total_duration = sum(scene_durations)
-    print(f"\n[✓] Video exported: {output_path}")
+    print(f"\n[+] Video exported: {output_path}")
     print(f"    Duration: {total_duration:.1f}s | Resolution: {VIDEO_WIDTH}x{VIDEO_HEIGHT} | FPS: {FPS}")
 
     return output_path, scene_durations
@@ -444,7 +586,7 @@ def generate_thumbnail(first_image_path: str, title: str) -> str:
 
     thumb_path = str(OUTPUT_DIR / "thumbnail.jpg")
     img.save(thumb_path, "JPEG", quality=95)
-    print(f"[✓] Thumbnail saved: {thumb_path}")
+    print(f"[+] Thumbnail saved: {thumb_path}")
     return thumb_path
 
 
@@ -481,7 +623,7 @@ def generate_subtitles(scenes: list, durations: list) -> str:
 
             current_time = end_time + 0.5  # 0.5s gap between scenes
 
-    print(f"[✓] Subtitles saved: {srt_path}")
+    print(f"[+] Subtitles saved: {srt_path}")
     return srt_path
 
 
@@ -489,65 +631,109 @@ def generate_subtitles(scenes: list, durations: list) -> str:
 # Main Pipeline
 # ──────────────────────────────────────────────
 def main():
-    """Run the full video generation pipeline."""
-    if len(sys.argv) < 2:
-        print("Usage: python main.py \"Your Topic Here\"")
-        sys.exit(1)
-
-    topic = sys.argv[1]
+    """Run the video generation pipeline (all-in-one or staged)."""
+    parser = argparse.ArgumentParser(description="AI Video Generation Pipeline")
+    parser.add_argument("topic", nargs="?", help="Video topic (required for 'script' stage or full run)")
+    parser.add_argument("--stage", choices=["script", "audio", "visuals", "assemble"], help="Run a specific stage")
+    args = parser.parse_args()
 
     # Validation
     if not GEMINI_API_KEY and not GROQ_API_KEY:
         print("[ERROR] No AI API key set. Add GEMINI_API_KEY or GROQ_API_KEY to .env")
         sys.exit(1)
-    if not PEXELS_API_KEY:
-        print("[ERROR] PEXELS_API_KEY not set. Add it to your .env file.")
+    if not PEXELS_API_KEY and not UNSPLASH_ACCESS_KEY and not PIXABAY_API_KEY:
+        print("[ERROR] No image API key set. Add PEXELS_API_KEY, UNSPLASH_ACCESS_KEY, or PIXABAY_API_KEY to .env")
         sys.exit(1)
 
-    print("=" * 60)
-    print(f"  AI VIDEO GENERATION PIPELINE")
-    print(f"  Topic: {topic}")
-    print("=" * 60)
+    # Sanity check for n8n unparsed expressions
+    if args.topic and ("{{$json" in args.topic or "}}" in args.topic):
+        print(f"[ERROR] Invalid topic detected: '{args.topic}'")
+        print("  This looks like an unparsed n8n expression.")
+        print("  Fix: In n8n, change the Command parameter to 'Expression' mode.")
+        sys.exit(1)
 
-    start_time = time.time()
+    # ──────────────────────────────────────────────
+    # Mode 1: Full Pipeline (Legacy / default)
+    # ──────────────────────────────────────────────
+    if not args.stage:
+        if not args.topic:
+            print("Usage: python main.py \"Your Topic Here\"")
+            sys.exit(1)
+        
+        print("=" * 60)
+        print(f"  AI VIDEO GENERATION PIPELINE (FULL)")
+        print(f"  Topic: {args.topic}")
+        print("=" * 60)
+        setup_directories(clean=True)
+        
+        # Run all stages
+        script_data = generate_script(args.topic)
+        audio_paths = generate_voiceovers(script_data["scenes"])
+        image_paths = fetch_visuals(script_data["scenes"])
+        video_path, _ = assemble_video(image_paths, audio_paths, script_data["scenes"], script_data.get("title", args.topic))
+        generate_thumbnail(image_paths[0], script_data.get("title", args.topic))
+        # Subs skipped in full run for brevity, or add back if needed
+        return
 
-    # Setup
-    setup_directories()
+    # ──────────────────────────────────────────────
+    # Mode 2: Staged Execution (for n8n)
+    # ──────────────────────────────────────────────
+    print(f"\n=== Running Stage: {args.stage.upper()} ===")
+    
+    if args.stage == "script":
+        if not args.topic:
+            print("[ERROR] Topic is required for script stage.")
+            sys.exit(1)
+        setup_directories(clean=True)
+        script_data = generate_script(args.topic)
+        # Save state
+        state = {
+            "topic": args.topic,
+            "script": script_data,
+            "scenes": script_data["scenes"]
+        }
+        save_state(state)
+        print("[+] State saved. Ready for 'audio'.")
 
-    # Stage 1: Generate Script
-    script_data = generate_script(topic)
-    scenes = script_data["scenes"]
-    title = script_data.get("title", topic)
-    description = script_data.get("description", "")
+    elif args.stage == "audio":
+        state = load_state()
+        scenes = state["scenes"]
+        audio_paths = generate_voiceovers(scenes)
+        state["audio_paths"] = audio_paths
+        save_state(state)
+        print("[+] State saved. Ready for 'visuals'.")
 
-    # Stage 2: Generate Voiceovers
-    audio_paths = generate_voiceovers(scenes)
+    elif args.stage == "visuals":
+        state = load_state()
+        scenes = state["scenes"]
+        image_paths = fetch_visuals(scenes)
+        state["image_paths"] = image_paths
+        save_state(state)
+        print("[+] State saved. Ready for 'assemble'.")
 
-    # Stage 3: Fetch Visuals
-    image_paths = fetch_visuals(scenes)
-
-    # Stage 4: Assemble Video
-    video_path, scene_durations = assemble_video(image_paths, audio_paths, scenes, title)
-
-    # Bonus: Thumbnail
-    thumbnail_path = generate_thumbnail(image_paths[0], title)
-
-    # Bonus: Subtitles
-    srt_path = generate_subtitles(scenes, scene_durations)
-
-    # Bonus: Print SEO info
-    elapsed = time.time() - start_time
-
-    print("\n" + "=" * 60)
-    print("  PIPELINE COMPLETE")
-    print("=" * 60)
-    print(f"\n  Video:      {video_path}")
-    print(f"  Thumbnail:  {thumbnail_path}")
-    print(f"  Subtitles:  {srt_path}")
-    print(f"\n  SEO Title:       {title}")
-    print(f"  SEO Description: {description}")
-    print(f"\n  Total time: {elapsed:.1f}s")
-    print("=" * 60)
+    elif args.stage == "assemble":
+        state = load_state()
+        if "audio_paths" not in state or "image_paths" not in state:
+            print("[ERROR] Missing audio or content. Run previous stages first.")
+            sys.exit(1)
+            
+        video_path, durations = assemble_video(
+            state["image_paths"], 
+            state["audio_paths"], 
+            state["scenes"], 
+            state["script"].get("title", state["topic"])
+        )
+        
+        # Bonus items
+        thumb_path = generate_thumbnail(state["image_paths"][0], state["script"].get("title", state["topic"]))
+        srt_path = generate_subtitles(state["scenes"], durations)
+        
+        print("\n" + "=" * 60)
+        print("  PIPELINE COMPLETE")
+        print("=" * 60)
+        print(f"  Video: {video_path}")
+        print(f"  Thumb: {thumb_path}")
+        print(f"  Subs:  {srt_path}")
 
 
 if __name__ == "__main__":

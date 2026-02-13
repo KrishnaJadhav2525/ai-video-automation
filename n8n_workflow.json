@@ -1,0 +1,141 @@
+{
+  "name": "AI Video Generation Pipeline",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "a1b2c3d4-e5f6-7890-abcd-000000000001",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        250,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{ json: { topic: 'The History of Chess' } }];"
+      },
+      "id": "a1b2c3d4-e5f6-7890-abcd-000000000002",
+      "name": "Set Topic",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        470,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "command": "={{ 'cd \"c:\\\\video automation\\\\ai-video-automation\" && python -u main.py \"' + $json.topic + '\" --stage script' }}"
+      },
+      "id": "chain-node-001",
+      "name": "Generate Script",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        690,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "command": "cd \"c:\\video automation\\ai-video-automation\" && python -u main.py --stage audio"
+      },
+      "id": "chain-node-002",
+      "name": "Generate Audio",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        910,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "command": "cd \"c:\\video automation\\ai-video-automation\" && python -u main.py --stage visuals"
+      },
+      "id": "chain-node-003",
+      "name": "Fetch Visuals",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        1130,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "command": "cd \"c:\\video automation\\ai-video-automation\" && python -u main.py --stage assemble"
+      },
+      "id": "chain-node-004",
+      "name": "Assemble Video",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        1350,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Set Topic",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set Topic": {
+      "main": [
+        [
+          {
+            "node": "Generate Script",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Script": {
+      "main": [
+        [
+          {
+            "node": "Generate Audio",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Audio": {
+      "main": [
+        [
+          {
+            "node": "Fetch Visuals",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Visuals": {
+      "main": [
+        [
+          {
+            "node": "Assemble Video",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionTimeout": 3600
+  }
+}

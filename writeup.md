@@ -1,17 +1,17 @@
-# Technical Write-Up: AI Video Generation Pipeline
+# AI Video Generation Pipeline - Submission Write-up
 
-## Tool Selection Rationale
+## Tools Used
+- **Orchestration:** n8n (Workflow automation) & Python (Core logic).
+- **Script Generation:** Google Gemini 2.0 Flash (Primary) with Groq/Llama-3 (Fallback).
+- **Voiceover:** Edge TTS (`en-US-ChristopherNeural`) for high-quality, free neural speech.
+- **Visuals:** Pexels, Unsplash, and Pixabay APIs (Multi-source aggregation for better relevance).
+- **Assembly:** MoviePy (FFmpeg wrapper) for video editing; Pillow for thumbnail generation.
 
-Every tool in this pipeline was chosen per assignment requirements, prioritizing **zero-cost, local-first execution**. **n8n** (self-hosted) serves as the orchestration layer because it provides a visual workflow builder with a Manual Trigger node that cleanly passes the topic into **Python**, our core programming language. **Google Gemini** (free tier: 15 RPM, 1 million tokens/minute) generates structured JSON scripts — chosen over Groq/Grok for its generous free quota and reliable JSON output. **Edge TTS** provides Microsoft-quality neural voices with zero API keys and no rate limits, making it the most robust free voiceover option. **Pexels API** (200 req/hour free) supplies royalty-free HD stock images. Finally, **MoviePy** wraps **FFmpeg** in a Pythonic API, enabling Ken Burns effects, fade transitions, and precise audio synchronization without shell scripting.
+## Biggest Challenge
+**Execution Speed vs. Quality.** 
+Rendering 1080p video with Python is CPU-intensive. Initial builds took over 10 minutes per video, which was unacceptable for automation. Optimizing `moviepy` with `preset='ultrafast'`, implementing threaded writing, and removing complex per-frame effects (like Ken Burns) were crucial steps. This reduced generation time to under 60 seconds while maintaining acceptable visual quality. Additionally, finding relevant free stock images for abstract topics was difficult, requiring a keyword simplification algorithm (`_simplify_query`) and a multi-source fallback system.
 
-## End-to-End Pipeline Flow
-
-The user clicks n8n's Manual Trigger, which passes a topic string to an Execute Command node. This invokes `main.py "<topic>"`, which runs four sequential stages: (1) Gemini generates a 5–7 scene script with narration and visual queries; (2) Edge TTS converts each narration into MP3; (3) Pexels fetches matching landscape images per scene; (4) MoviePy composites image clips with Ken Burns zoom, overlays audio, applies fade transitions, and exports a 1920×1080 MP4 at 24fps. Bonus outputs include a thumbnail, SRT subtitles, and SEO metadata.
-
-## Biggest Technical Challenge
-
-The hardest problem was making still images feel cinematic. A simple slideshow looks unprofessional, so I implemented a **Ken Burns (zoom-in) effect** using MoviePy's `transform()` function — each frame is dynamically cropped and resized to simulate camera movement. Combined with cross-scene fade transitions and precise audio-to-image synchronization, the result feels like a produced video rather than a slide deck.
-
-## Scaling Improvements
-
-If scaled, the pipeline would benefit from: (1) **parallel scene processing** using `asyncio` for simultaneous TTS + image fetching; (2) **AI-generated images** (Stable Diffusion) instead of stock photos for unique visuals; (3) **subtitle burn-in** with word-level timestamps from Whisper; (4) **queue-based orchestration** replacing n8n's Execute Command with a message broker for concurrent video generation; and (5) **cloud storage integration** to upload finished videos directly to YouTube via its API.
+## Improvements
+1. **Dynamic Visuals:** Replace static images with AI-generated video clips (e.g., Kling/Luma) or stock video footage for better engagement.
+2. **Native n8n Integration:** Decompose the monolithic Python script into granular n8n nodes for better error handling, visibility, and scalability.
+3. **Advanced Captions:** Implement burn-in subtitles with word-level highlight animations (Karaoke style) instead of static SRT files.
