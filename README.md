@@ -49,6 +49,8 @@ ai-video-automation/
 |---------|---------|-----------|
 | **Google Gemini** | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) | 15 RPM, 1M tokens/min |
 | **Pexels** | [pexels.com/api](https://www.pexels.com/api/) | 200 requests/hour |
+| **Unsplash** | [unsplash.com/developers](https://unsplash.com/developers) | 50 requests/hour (Free) |
+| **Pixabay** | [pixabay.com/api/docs](https://pixabay.com/api/docs/) | 5000 requests/hour |
 
 ### Setup API Keys
 
@@ -60,6 +62,8 @@ ai-video-automation/
    ```
    GEMINI_API_KEY=your_actual_gemini_key
    PEXELS_API_KEY=your_actual_pexels_key
+   UNSPLASH_ACCESS_KEY=your_actual_unsplash_key
+   PIXABAY_API_KEY=your_actual_pixabay_key
    ```
 
 ---
@@ -110,7 +114,7 @@ Manual Trigger → Set Topic (Code Node) → Execute Command (python main.py)
 |-------|------|--------------|
 | 1. Script Generation | Google Gemini | Generates structured JSON script with scenes, narration, and visual queries |
 | 2. Voiceover | Edge TTS | Converts narration to natural-sounding MP3 audio |
-| 3. Visuals | Pexels API | Fetches HD landscape images matching each scene |
+| 3. Visuals | Pexels, Unsplash, Pixabay | Fetches HD landscape images matching each scene (Multi-source fallback) |
 | 4. Video Assembly | MoviePy + FFmpeg | Combines images + audio with Ken Burns effect, exports 1080p MP4 |
 
 ### Bonus Features
