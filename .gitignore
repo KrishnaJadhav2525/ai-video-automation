@@ -1,4 +1,7 @@
 .env
+project_explanation.txt
+simple_pipeline_explanation.txt
+improvements_summary.txt
 output/
 Thumbs.db
 .DS_Store

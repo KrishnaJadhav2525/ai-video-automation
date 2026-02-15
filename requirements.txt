@@ -4,3 +4,4 @@ requests
 moviepy
 Pillow
 python-dotenv
+tenacity

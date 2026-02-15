@@ -4,6 +4,11 @@ Fully automated AI-powered video generation: **one topic in → one YouTube-read
 
 Orchestrated by **n8n**, powered by **Gemini**, **Edge TTS**, **Pexels**, and **MoviePy/FFmpeg** — all free-tier.
 
+**New Features:**
+- 🔄 **Smart Retry Logic:** Auto-retries failed API calls with exponential backoff.
+- 📝 **Structured Logging:** Detailed logs in `output/pipeline.log`.
+- 📊 **Error Reporting:** Generates `output/error_report.json` with success/failure stats.
+
 ---
 
 ## 📁 Folder Structure
@@ -21,6 +26,8 @@ ai-video-automation/
     ├── final_video.mp4     # YouTube-ready video
     ├── thumbnail.jpg       # Auto-generated thumbnail
     ├── subtitles.srt       # SRT subtitle file
+    ├── pipeline.log        # Detailed execution logs
+    ├── error_report.json   # JSON summary of errors
     └── temp/               # Intermediate files
 ```
 
@@ -111,6 +118,8 @@ Manual Trigger → Set Topic (Code Node) → Execute Command (python main.py)
 - 🖼️ **Thumbnail** — Auto-generated from first scene with title overlay
 - 📝 **Subtitles** — SRT file generated from scene narrations
 - 🔍 **SEO** — YouTube-optimized title and description printed to console
+- 🛡️ **Robustness** — Auto-retries on API rate limits (HTTP 429) & tracks visual fallback chain
+
 
 ---
 

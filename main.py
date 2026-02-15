@@ -38,6 +38,7 @@ import google.generativeai as genai
 import google.generativeai as genai
 import argparse
 from dotenv import load_dotenv
+from pipeline_utils import setup_logging, retry_api_call, retry_async_api_call, tracker, logger
 
 # ──────────────────────────────────────────────
 # Configuration
@@ -65,7 +66,7 @@ def setup_directories(clean=False):
     TEMP_DIR.mkdir(exist_ok=True)
     if clean and STATE_FILE.exists():
         STATE_FILE.unlink()
-    print("[+] Directories ready.")
+    logger.info("[+] Directories ready.")
 
 
 def save_state(data: dict):
@@ -77,7 +78,7 @@ def save_state(data: dict):
 def load_state() -> dict:
     """Load pipeline state from JSON."""
     if not STATE_FILE.exists():
-        print("[!] No state file found. Run 'script' stage first.")
+        logger.error("[!] No state file found. Run 'script' stage first.")
         sys.exit(1)
     with open(STATE_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -119,18 +120,20 @@ IMPORTANT:
 """
 
 
+@retry_api_call("Gemini")
 def _generate_with_gemini(prompt: str) -> str:
     """Generate script using Google Gemini."""
-    print("  [->] Trying Gemini...")
+    logger.info("  [->] Trying Gemini...")
     genai.configure(api_key=GEMINI_API_KEY)
     model = genai.GenerativeModel("gemini-2.0-flash")
     response = model.generate_content(prompt)
     return response.text.strip()
 
 
+@retry_api_call("Groq")
 def _generate_with_groq(prompt: str) -> str:
     """Generate script using Groq (free tier, llama model)."""
-    print("  [->] Trying Groq...")
+    logger.info("  [->] Trying Groq...")
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
@@ -153,7 +156,7 @@ def generate_script(topic: str) -> dict:
     Tries Gemini first; falls back to Groq if Gemini fails.
     Returns dict with 'title', 'description', 'scenes' list.
     """
-    print(f"\n[Stage 1] Generating script for: {topic}")
+    logger.info(f"\n[Stage 1] Generating script for: {topic}")
 
     prompt = SCRIPT_PROMPT_TEMPLATE.format(topic=topic)
     raw_text = None
@@ -162,18 +165,18 @@ def generate_script(topic: str) -> dict:
     if GEMINI_API_KEY:
         try:
             raw_text = _generate_with_gemini(prompt)
-            print("  [+] Gemini responded.")
+            logger.info("  [+] Gemini responded.")
         except Exception as e:
-            print(f"  [!] Gemini failed: {e}")
-            print("  [->] Falling back to Groq...")
+            logger.warning(f"  [!] Gemini failed: {e}")
+            logger.info("  [->] Falling back to Groq...")
 
     # Fallback to Groq
     if raw_text is None and GROQ_API_KEY:
         try:
             raw_text = _generate_with_groq(prompt)
-            print("  [+] Groq responded.")
+            logger.info("  [+] Groq responded.")
         except Exception as e:
-            print(f"  [!] Groq also failed: {e}")
+            logger.error(f"  [!] Groq also failed: {e}")
 
     if raw_text is None:
         print("[ERROR] All script generation methods failed.")
@@ -187,13 +190,14 @@ def generate_script(topic: str) -> dict:
     script_data = json.loads(raw_text)
 
     scene_count = len(script_data.get("scenes", []))
-    print(f"[+] Script generated: \"{script_data.get('title', '')}\" — {scene_count} scenes")
+    logger.info(f"[+] Script generated: \"{script_data.get('title', '')}\" — {scene_count} scenes")
     return script_data
 
 
 # ──────────────────────────────────────────────
 # Stage 2: Voiceover Generation (Edge TTS)
 # ──────────────────────────────────────────────
+@retry_async_api_call("EdgeTTS")
 async def _generate_single_voiceover(text: str, output_path: str, voice: str):
     """Generate a single audio file from text using Edge TTS."""
     communicate = edge_tts.Communicate(text, voice)
@@ -205,7 +209,7 @@ def generate_voiceovers(scenes: list) -> list:
     Generate voiceover MP3 for each scene.
     Returns list of audio file paths.
     """
-    print("\n[Stage 2] Generating voiceovers with Edge TTS...")
+    logger.info("\n[Stage 2] Generating voiceovers with Edge TTS...")
     audio_paths = []
 
     for i, scene in enumerate(scenes):
@@ -214,9 +218,9 @@ def generate_voiceovers(scenes: list) -> list:
 
         asyncio.run(_generate_single_voiceover(narration, audio_path, VOICE))
         audio_paths.append(audio_path)
-        print(f"  [+] Scene {i + 1} audio saved ({len(narration)} chars)")
+        logger.info(f"  [+] Scene {i + 1} audio saved ({len(narration)} chars)")
 
-    print(f"[+] All {len(audio_paths)} voiceovers generated.")
+    logger.info(f"[+] All {len(audio_paths)} voiceovers generated.")
     return audio_paths
 
 
@@ -255,6 +259,7 @@ def _download_image(url: str) -> Image.Image | None:
         return None
 
 
+@retry_api_call("Pexels")
 def fetch_pexels_image(query: str) -> Image.Image | None:
     """Fetch a random landscape image from Pexels for the given query."""
     if not PEXELS_API_KEY:
@@ -263,18 +268,17 @@ def fetch_pexels_image(query: str) -> Image.Image | None:
     headers = {"Authorization": PEXELS_API_KEY}
     params = {"query": query, "per_page": 15, "orientation": "landscape"}
 
-    try:
-        resp = requests.get(url, headers=headers, params=params, timeout=15)
-        resp.raise_for_status()
-        photos = resp.json().get("photos", [])
-        if photos:
-            photo = random.choice(photos)
-            return _download_image(photo["src"]["large2x"])
-    except Exception as e:
-        print(f"    [!] Pexels failed for '{query}': {e}")
+    # Requests automatically retried by decorator if exception raised
+    resp = requests.get(url, headers=headers, params=params, timeout=15)
+    resp.raise_for_status()
+    photos = resp.json().get("photos", [])
+    if photos:
+        photo = random.choice(photos)
+        return _download_image(photo["src"]["large2x"])
     return None
 
 
+@retry_api_call("Unsplash")
 def fetch_unsplash_image(query: str) -> Image.Image | None:
     """Fetch a random landscape image from Unsplash for the given query."""
     if not UNSPLASH_ACCESS_KEY:
@@ -288,19 +292,17 @@ def fetch_unsplash_image(query: str) -> Image.Image | None:
         "content_filter": "high",
     }
 
-    try:
-        resp = requests.get(url, headers=headers, params=params, timeout=15)
-        resp.raise_for_status()
-        results = resp.json().get("results", [])
-        if results:
-            photo = random.choice(results)
-            # Use 'regular' size (~1080px width) for good quality
-            return _download_image(photo["urls"]["regular"])
-    except Exception as e:
-        print(f"    [!] Unsplash failed for '{query}': {e}")
+    resp = requests.get(url, headers=headers, params=params, timeout=15)
+    resp.raise_for_status()
+    results = resp.json().get("results", [])
+    if results:
+        photo = random.choice(results)
+        # Use 'regular' size (~1080px width) for good quality
+        return _download_image(photo["urls"]["regular"])
     return None
 
 
+@retry_api_call("Pixabay")
 def fetch_pixabay_image(query: str) -> Image.Image | None:
     """Fetch a random landscape image from Pixabay for the given query."""
     if not PIXABAY_API_KEY:
@@ -316,15 +318,12 @@ def fetch_pixabay_image(query: str) -> Image.Image | None:
         "min_width": 1280,
     }
 
-    try:
-        resp = requests.get(url, headers={}, params=params, timeout=15)
-        resp.raise_for_status()
-        hits = resp.json().get("hits", [])
-        if hits:
-            photo = random.choice(hits)
-            return _download_image(photo["largeImageURL"])
-    except Exception as e:
-        print(f"    [!] Pixabay failed for '{query}': {e}")
+    resp = requests.get(url, headers={}, params=params, timeout=15)
+    resp.raise_for_status()
+    hits = resp.json().get("hits", [])
+    if hits:
+        photo = random.choice(hits)
+        return _download_image(photo["largeImageURL"])
     return None
 
 
@@ -345,23 +344,35 @@ def fetch_image_multi_source(query: str) -> Image.Image | None:
     fetchers = list(_IMAGE_FETCHERS)
     random.shuffle(fetchers)
 
+    fallback_chain = " -> ".join([name for name, _ in fetchers])
+    logger.info(f"    [Logic] Attempting visuals for '{query}': {fallback_chain}")
+
     # Attempt 1: original query across all sources
     for name, fetcher in fetchers:
-        img = fetcher(query)
-        if img is not None:
-            print(f"    [+] Found via {name}: '{query}'")
-            return img
+        try:
+            img = fetcher(query)
+            if img is not None:
+                logger.info(f"    [+] Found via {name}: '{query}'")
+                return img
+        except Exception:
+            # Exceptions inside fetcher are handled/retried by decorator, 
+            # but if they bubble up (after retries exhausted), we catch here to try next source
+            logger.warning(f"    [!] {name} exhausted retries for '{query}'")
+            continue
 
     # Attempt 2: simplified query across all sources
     simple_query = _simplify_query(query)
     if simple_query != query:
-        print(f"    [RETRY] Retrying with simplified query: '{simple_query}'")
+        logger.info(f"    [RETRY] Retrying with simplified query: '{simple_query}'")
         random.shuffle(fetchers)
         for name, fetcher in fetchers:
-            img = fetcher(simple_query)
-            if img is not None:
-                print(f"    [+] Found via {name}: '{simple_query}'")
-                return img
+            try:
+                img = fetcher(simple_query)
+                if img is not None:
+                    logger.info(f"    [+] Found via {name}: '{simple_query}'")
+                    return img
+            except Exception:
+                continue
 
     return None
 
@@ -441,13 +452,14 @@ def fetch_visuals(scenes: list) -> list:
         query = scene["visual_query"]
         img_path = str(TEMP_DIR / f"scene_{index + 1}.jpg")
         
-        print(f"  [->] Fetching scene {index + 1}: '{query}'...")
+        logger.info(f"  [->] Fetching scene {index + 1}: '{query}'...")
         img = fetch_image_multi_source(query)
         if img is None:
-            print(f"  [!] All sources failed — using fallback for scene {index + 1}: '{query}'")
+            logger.warning(f"  [!] All sources failed — using fallback for scene {index + 1}: '{query}'")
             img = create_fallback_image(query)
+            tracker.record_attempt("Fallback", True, latency=0.1) # Track fallback usage
         else:
-            print(f"  [+] Scene {index + 1} image found.")
+            logger.info(f"  [+] Scene {index + 1} image found.")
 
         # Resize/crop immediately
         try:
@@ -455,7 +467,8 @@ def fetch_visuals(scenes: list) -> list:
              img.save(img_path, "JPEG", quality=95)
              return index, img_path
         except Exception as e:
-            print(f"  [!] Error processing image for scene {index + 1}: {e}")
+            logger.error(f"  [!] Error processing image for scene {index + 1}: {e}")
+            tracker.record_attempt("ImageProcessing", False, error_msg=str(e))
             return index, None
 
     # Run in parallel
@@ -469,9 +482,9 @@ def fetch_visuals(scenes: list) -> list:
     final_paths = [p for p in results if p]
     
     if len(final_paths) != len(scenes):
-        print("[!] Warning: Some scenes failed to generate images.")
+        logger.warning("[!] Warning: Some scenes failed to generate images.")
     
-    print(f"[+] All {len(final_paths)} visuals ready.")
+    logger.info(f"[+] All {len(final_paths)} visuals ready.")
     return final_paths
 
 
@@ -498,7 +511,7 @@ def assemble_video(
     Assemble the final video from images + audio.
     Returns path to the final MP4.
     """
-    print("\n[Stage 4] Assembling video with MoviePy...")
+    logger.info("\n[Stage 4] Assembling video with MoviePy...")
     clips = []
     scene_durations = []
 
@@ -519,7 +532,7 @@ def assemble_video(
             video_clip = video_clip.with_effects([vfx.FadeOut(0.8)])
 
         clips.append(video_clip)
-        print(f"  [+] Scene {i + 1}: {duration:.1f}s")
+        logger.info(f"  [+] Scene {i + 1}: {duration:.1f}s")
 
     # Concatenate all scene clips
     final_clip = concatenate_videoclips(clips, method="compose")
@@ -543,8 +556,8 @@ def assemble_video(
         clip.close()
 
     total_duration = sum(scene_durations)
-    print(f"\n[+] Video exported: {output_path}")
-    print(f"    Duration: {total_duration:.1f}s | Resolution: {VIDEO_WIDTH}x{VIDEO_HEIGHT} | FPS: {FPS}")
+    logger.info(f"\n[+] Video exported: {output_path}")
+    logger.info(f"    Duration: {total_duration:.1f}s | Resolution: {VIDEO_WIDTH}x{VIDEO_HEIGHT} | FPS: {FPS}")
 
     return output_path, scene_durations
 
@@ -554,7 +567,7 @@ def assemble_video(
 # ──────────────────────────────────────────────
 def generate_thumbnail(first_image_path: str, title: str) -> str:
     """Generate a thumbnail from the first scene image with title overlay."""
-    print("\n[Bonus] Generating thumbnail...")
+    logger.info("\n[Bonus] Generating thumbnail...")
 
     img = Image.open(first_image_path).copy()
     draw = ImageDraw.Draw(img)
@@ -586,7 +599,7 @@ def generate_thumbnail(first_image_path: str, title: str) -> str:
 
     thumb_path = str(OUTPUT_DIR / "thumbnail.jpg")
     img.save(thumb_path, "JPEG", quality=95)
-    print(f"[+] Thumbnail saved: {thumb_path}")
+    logger.info(f"[+] Thumbnail saved: {thumb_path}")
     return thumb_path
 
 
@@ -623,7 +636,7 @@ def generate_subtitles(scenes: list, durations: list) -> str:
 
             current_time = end_time + 0.5  # 0.5s gap between scenes
 
-    print(f"[+] Subtitles saved: {srt_path}")
+    logger.info(f"[+] Subtitles saved: {srt_path}")
     return srt_path
 
 
@@ -673,6 +686,9 @@ def main():
         video_path, _ = assemble_video(image_paths, audio_paths, script_data["scenes"], script_data.get("title", args.topic))
         generate_thumbnail(image_paths[0], script_data.get("title", args.topic))
         # Subs skipped in full run for brevity, or add back if needed
+        
+        # Generate Error Report
+        tracker.generate_report(OUTPUT_DIR / "error_report.json")
         return
 
     # ──────────────────────────────────────────────
@@ -728,12 +744,15 @@ def main():
         thumb_path = generate_thumbnail(state["image_paths"][0], state["script"].get("title", state["topic"]))
         srt_path = generate_subtitles(state["scenes"], durations)
         
-        print("\n" + "=" * 60)
-        print("  PIPELINE COMPLETE")
-        print("=" * 60)
-        print(f"  Video: {video_path}")
-        print(f"  Thumb: {thumb_path}")
-        print(f"  Subs:  {srt_path}")
+        logger.info("\n" + "=" * 60)
+        logger.info("  PIPELINE COMPLETE")
+        logger.info("=" * 60)
+        logger.info(f"  Video: {video_path}")
+        logger.info(f"  Thumb: {thumb_path}")
+        logger.info(f"  Subs:  {srt_path}")
+        
+    # Generate Error Report
+    tracker.generate_report(OUTPUT_DIR / "error_report.json")
 
 
 if __name__ == "__main__":
